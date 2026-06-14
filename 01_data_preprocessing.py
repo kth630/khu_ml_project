@@ -1,65 +1,70 @@
+"""Trigger Email 모델링용 최종 분석 데이터를 생성하는 전처리 스크립트.
+
+실행 결과
+---------
+- 원본 메시지 로그에서 email 채널 + trigger 캠페인만 추출한다.
+- 고객별 과거 발송/open/click 이력 기반 recency/frequency feature를 만든다.
+- 최종 모델링 데이터는 outputs/processed/A_ml_dataset.pkl에 저장한다.
+
+주의
+----
+- messages-demo.csv가 매우 크기 때문에 chunk 단위로 읽는다.
+- pyarrow가 없는 환경에서도 실행되도록 parquet 대신 pickle로 저장한다.
+"""
+
+from __future__ import annotations
+
 from collections import defaultdict, deque
 from pathlib import Path
+import json
 import warnings
 
 import numpy as np
 import pandas as pd
 
 
+# 모든 입력/출력 경로는 이 스크립트가 있는 email_ml 폴더를 기준으로 잡는다.
+ROOT = Path(__file__).resolve().parent
+OUTPUT_ROOT = ROOT / "outputs"
+PROCESSED_DIR = OUTPUT_ROOT / "processed"
+
+INPUT_MESSAGES = ROOT / "messages-demo.csv"
+INPUT_CAMPAIGNS = ROOT / "campaigns.csv"
+INPUT_CLIENTS = ROOT / "client_first_purchase_date.csv"
+INPUT_HOLIDAYS = ROOT / "holidays.csv"
+
+OUTPUT_DATASET = PROCESSED_DIR / "A_ml_dataset.pkl"
+OUTPUT_SAMPLE = PROCESSED_DIR / "A_ml_dataset_sample.csv"
+OUTPUT_SUMMARY_CSV = PROCESSED_DIR / "preprocessing_summary.csv"
+OUTPUT_SUMMARY_JSON = PROCESSED_DIR / "preprocessing_summary.json"
+
 CHUNKSIZE = 500_000
 PROVIDER_MIN_COUNT = 10_000
 
-# 원본 CSV 일부 컬럼의 mixed type 경고를 숨긴다.
 warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 
 
-def resolve_project_root(required_files: list[str]) -> Path:
-    """Find the project root that contains all required files."""
-    script_dir = Path(__file__).resolve().parent
-    cwd = Path.cwd().resolve()
-    known_project_dir = (
-        Path.home()
-        / "Desktop"
-        / "학교"
-        / "26-1"
-        / "머신러닝기초및응용"
-        / "머신러닝_프젝"
-        / "ecommerce"
-    )
-
-    candidates = [script_dir, cwd, known_project_dir]
-    candidates.extend(script_dir.parents)
-    candidates.extend(cwd.parents)
-
-    for candidate in candidates:
-        if all((candidate / name).exists() for name in required_files):
-            return candidate
-
-    checked = "\n".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        "Required project files were not found.\n"
-        f"Required files: {required_files}\n"
-        f"Checked paths:\n{checked}"
-    )
+def ensure_output_dir() -> None:
+    """전처리 산출물을 저장할 폴더를 만든다."""
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 
-PROJECT_ROOT = resolve_project_root(["messages-demo.csv", "campaigns.csv"])
-INPUT_MESSAGES = PROJECT_ROOT / "messages-demo.csv"
-INPUT_CAMPAIGNS = PROJECT_ROOT / "campaigns.csv"
-OUTPUT_DATASET = PROJECT_ROOT / "A_ml_dataset.parquet"
+def check_inputs() -> None:
+    """전처리에 반드시 필요한 원본 CSV 파일이 있는지 확인한다."""
+    required = [INPUT_MESSAGES, INPUT_CAMPAIGNS]
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing required input files: " + ", ".join(str(path) for path in missing))
 
 
 def as_bool(series: pd.Series) -> pd.Series:
-    """Convert mixed boolean-like values into True/False."""
-    return series.astype(str).str.lower().isin(["true", "t", "1"])
+    """t/f, true/false, 1/0 형태가 섞인 값을 boolean으로 변환한다."""
+    return series.astype("string").str.lower().isin(["true", "t", "1", "yes", "y"])
 
 
-def load_trigger_email_messages() -> pd.DataFrame:
-    """Load email-channel messages that belong to trigger campaigns."""
-    campaigns = pd.read_csv(
-        INPUT_CAMPAIGNS,
-        usecols=["id", "campaign_type", "topic"],
-    )
+def load_trigger_email_messages() -> tuple[pd.DataFrame, dict[str, int]]:
+    """email 채널이면서 trigger 캠페인에 속한 메시지만 읽어온다."""
+    campaigns = pd.read_csv(INPUT_CAMPAIGNS, usecols=["id", "campaign_type", "topic"])
     trigger_campaigns = (
         campaigns[campaigns["campaign_type"].eq("trigger")][["id", "topic"]]
         .rename(columns={"id": "campaign_id"})
@@ -79,18 +84,40 @@ def load_trigger_email_messages() -> pd.DataFrame:
         "is_soft_bounced",
     ]
     dtype = {
+        "message_id": "string",
+        "client_id": "string",
+        "channel": "string",
+        "email_provider": "string",
         "is_opened": "string",
         "is_clicked": "string",
         "is_hard_bounced": "string",
         "is_soft_bounced": "string",
     }
 
-    parts = []
-    for chunk in pd.read_csv(INPUT_MESSAGES, usecols=usecols, dtype=dtype, chunksize=CHUNKSIZE):
+    stats = {
+        "message_rows_read": 0,
+        "email_rows": 0,
+        "trigger_email_rows": 0,
+        "trigger_campaigns": int(len(trigger_campaigns)),
+    }
+    parts: list[pd.DataFrame] = []
+
+    # 대용량 messages-demo.csv를 한 번에 메모리에 올리지 않기 위해 chunk 단위로 처리한다.
+    for chunk_no, chunk in enumerate(
+        pd.read_csv(INPUT_MESSAGES, usecols=usecols, dtype=dtype, chunksize=CHUNKSIZE),
+        start=1,
+    ):
+        stats["message_rows_read"] += int(len(chunk))
         chunk = chunk[chunk["channel"].eq("email")]
+        stats["email_rows"] += int(len(chunk))
         chunk = chunk.merge(trigger_campaigns, on="campaign_id", how="inner")
+        stats["trigger_email_rows"] += int(len(chunk))
         if len(chunk):
             parts.append(chunk)
+        print(
+            f"   chunk {chunk_no}: read={stats['message_rows_read']:,}, "
+            f"email={stats['email_rows']:,}, trigger_email={stats['trigger_email_rows']:,}"
+        )
 
     if not parts:
         raise ValueError("No email trigger messages were found after filtering.")
@@ -103,17 +130,17 @@ def load_trigger_email_messages() -> pd.DataFrame:
         df[col] = as_bool(df[col]).astype(np.int8)
 
     df["client_id"] = df["client_id"].astype(str)
-    df["topic"] = df["topic"].astype(str)
+    df["topic"] = df["topic"].fillna("unknown").astype(str)
     df["email_provider"] = df["email_provider"].fillna("unknown").astype(str)
-    return df
+    return df, stats
 
 
 def build_history_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create prior-history, recency, and 7-day frequency features per client."""
+    """고객별 과거 발송/open/click 이력을 이용해 history feature를 생성한다."""
     df = df.sort_values(["client_id", "sent_at", "campaign_id", "message_id"]).reset_index(drop=True)
     n = len(df)
 
-    sent_ns = df["sent_at"].astype("int64").to_numpy()
+    sent_ns = df["sent_at"].to_numpy(dtype="datetime64[ns]").astype("int64")
     client = df["client_id"].to_numpy()
     opened = df["is_opened"].to_numpy()
     clicked = df["is_clicked"].to_numpy()
@@ -141,6 +168,7 @@ def build_history_features(df: pd.DataFrame) -> pd.DataFrame:
     last = defaultdict(dict)
     recent_events = defaultdict(lambda: {event: deque() for event in events})
 
+    # 각 고객의 마지막 행동 시각과 최근 7일 이벤트 큐를 갱신하면서 feature를 만든다.
     for i in range(n):
         c = client[i]
         ts = int(sent_ns[i])
@@ -171,19 +199,19 @@ def build_history_features(df: pd.DataFrame) -> pd.DataFrame:
                 recent_events[c][event].append(ts)
                 last[c][event] = ts
 
+        if i and i % 500_000 == 0:
+            print(f"   history rows processed: {i:,}/{n:,}")
+
     features = pd.DataFrame(feats)
     return pd.concat([df.reset_index(drop=True), features], axis=1)
 
 
 def prepare_final_dataset(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply warm-up exclusion, error filtering, provider grouping, and final column selection."""
+    """warm-up 기간 제거, 이상 행 제거, provider grouping 후 최종 컬럼을 선택한다."""
     cutoff = df["sent_at"].min() + pd.Timedelta(days=7)
     out = df[df["sent_at"].ge(cutoff)].copy()
-
-    # 표본 수가 극히 작은 topic은 안정적인 모델링과 해석을 위해 제외한다.
     out = out[~out["topic"].eq("price drop")].copy()
 
-    # 바운스 처리된 메시지가 opened로 기록된 논리 오류 행은 제외한다.
     bounce_open = (
         out["is_opened"].eq(1)
         & (out["is_hard_bounced"].eq(1) | out["is_soft_bounced"].eq(1))
@@ -232,13 +260,38 @@ def prepare_final_dataset(df: pd.DataFrame) -> pd.DataFrame:
             "is_clicked": "target_clicked",
         }
     )
-    final = final.sort_values("sent_at").reset_index(drop=True)
-    return final
+    return final.sort_values("sent_at").reset_index(drop=True)
+
+
+def write_summary(final: pd.DataFrame, stats: dict[str, int]) -> None:
+    """전처리 과정에서 확인한 핵심 수치를 CSV와 JSON으로 저장한다."""
+    opened = final[final["target_opened"].eq(1)]
+    summary = {
+        **stats,
+        "final_rows": int(len(final)),
+        "final_columns": int(len(final.columns)),
+        "period_start": str(final["sent_at"].min()),
+        "period_end": str(final["sent_at"].max()),
+        "open_rate": float(final["target_opened"].mean()),
+        "ctr": float(final["target_clicked"].mean()),
+        "ctor": float(opened["target_clicked"].mean()) if len(opened) else None,
+        "input_messages": str(INPUT_MESSAGES),
+        "input_campaigns": str(INPUT_CAMPAIGNS),
+        "optional_client_first_purchase_date_exists": INPUT_CLIENTS.exists(),
+        "optional_holidays_exists": INPUT_HOLIDAYS.exists(),
+        "output_dataset": str(OUTPUT_DATASET),
+    }
+    pd.DataFrame([summary]).to_csv(OUTPUT_SUMMARY_CSV, index=False, encoding="utf-8-sig")
+    OUTPUT_SUMMARY_JSON.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def main() -> None:
+    """전처리 전체 pipeline을 순서대로 실행한다."""
+    ensure_output_dir()
+    check_inputs()
+
     print("1/4 Load email trigger messages")
-    raw = load_trigger_email_messages()
+    raw, stats = load_trigger_email_messages()
     print(f"   raw trigger email rows: {len(raw):,}")
 
     print("2/4 Build recency/frequency features")
@@ -252,9 +305,12 @@ def main() -> None:
     opened = final[final["target_opened"].eq(1)]
     print(f"   click-after-open rate: {opened['target_clicked'].mean():.4f}")
 
-    print("4/4 Save A_ml_dataset.parquet")
-    final.to_parquet(OUTPUT_DATASET, index=False)
-    print(f"Saved: {OUTPUT_DATASET.resolve()}")
+    print("4/4 Save processed artifacts")
+    final.to_pickle(OUTPUT_DATASET)
+    final.head(10_000).to_csv(OUTPUT_SAMPLE, index=False, encoding="utf-8-sig")
+    write_summary(final, stats)
+    print(f"Saved dataset: {OUTPUT_DATASET.resolve()}")
+    print(f"Saved summary: {OUTPUT_SUMMARY_CSV.resolve()}")
 
 
 if __name__ == "__main__":
