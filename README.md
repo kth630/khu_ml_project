@@ -4,5 +4,10 @@
 
 주요 내용은 이메일 발송 이후 고객이 메일을 열었는지(`open`), 그리고 오픈 후 클릭까지 이어졌는지(`click_after_open`)를 예측하고 해석하는 코드입니다.
 
+## 분석 보고서
+
+- [보고서 보기 (PDF)](Trigger%20Email%20Funnel%20Analysis_보고서.pdf)
+- [수정용 원본 (Word)](Trigger%20Email%20Funnel%20Analysis_보고서.docx)
+
 
 원본 데이터 주소: https://www.kaggle.com/datasets/mkechinov/direct-messaging
